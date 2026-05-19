@@ -40,6 +40,11 @@
 #include "task.h"
 #include "timers.h"
 #include "stack_macros.h"
+#include "timelinescheduler.h"
+#include "FreeRTOSConfig.h"
+
+/* Global used to track the major cycle index */
+uint32_t g_majorCycleIndex = 0;
 
 /* The default definitions are only available for non-MPU ports. The
  * reason is that the stack alignment requirements vary for different
@@ -225,6 +230,30 @@
         configASSERT( listCURRENT_LIST_LENGTH( &( pxReadyTasksLists[ uxTopPriority ] ) ) > 0 ); \
         listGET_OWNER_OF_NEXT_ENTRY( pxCurrentTCB, &( pxReadyTasksLists[ uxTopPriority ] ) );   \
     } while( 0 )
+
+/*-----------------------------------------------------------*/
+
+    #if ( configUSE_TIMELINE_SCHEDULER == 1 )
+        #define taskSELECT_HIGHEST_PRIORITY_TASK()                                                  \
+        do {                                                                                        \
+            UBaseType_t uxTopPriority;                                                              \
+                                                                                                    \
+            /* Find the highest priority list that contains ready tasks. */                         \
+            portGET_HIGHEST_PRIORITY( uxTopPriority, uxTopReadyPriority );                          \
+            configASSERT( listCURRENT_LIST_LENGTH( &( pxReadyTasksLists[ uxTopPriority ] ) ) > 0 ); \
+            pxCurrentTCB = listGET_OWNER_OF_HEAD_ENTRY( &( pxReadyTasksLists[ uxTopPriority ] ) );  \
+        } while( 0 )
+    #else
+        #define taskSELECT_HIGHEST_PRIORITY_TASK()                                                  \
+        do {                                                                                        \
+            UBaseType_t uxTopPriority;                                                              \
+                                                                                                    \
+            /* Find the highest priority list that contains ready tasks. */                         \
+            portGET_HIGHEST_PRIORITY( uxTopPriority, uxTopReadyPriority );                          \
+            configASSERT( listCURRENT_LIST_LENGTH( &( pxReadyTasksLists[ uxTopPriority ] ) ) > 0 ); \
+            listGET_OWNER_OF_NEXT_ENTRY( pxCurrentTCB, &( pxReadyTasksLists[ uxTopPriority ] ) );   \
+        } while( 0 )
+    #endif
 
 /*-----------------------------------------------------------*/
 
@@ -419,6 +448,15 @@ typedef struct tskTaskControlBlock       /* The old naming convention is used to
         volatile uint32_t ulNotifiedValue[ configTASK_NOTIFICATION_ARRAY_ENTRIES ];
         volatile uint8_t ucNotifyState[ configTASK_NOTIFICATION_ARRAY_ENTRIES ];
     #endif
+
+    /* Added for timeline scheduling */
+    #if ( configUSE_TIMELINE_SCHEDULER == 1 )
+        BaseType_t xNeedsReset;        // Flag: stack needs reset on next switch-in
+        uint32_t usStackDepth;         // Stack depth for reset
+        TickType_t xStartTime;         //  start time
+        TickType_t xEndTime;           //  end time
+        TaskFunction_t pxTaskCode;     //  function code
+    #endif /* configUSE_TIMELINE_SCHEDULER */
 
     /* See the comments in FreeRTOS.h with the definition of
      * tskSTATIC_AND_DYNAMIC_ALLOCATION_POSSIBLE. */
@@ -3659,7 +3697,7 @@ void vTaskStartScheduler( void )
 {
     BaseType_t xReturn;
 
-    traceENTER_vTaskStartScheduler();
+    traceENTER_vTaskStartScheduler( xTickCount);
 
     #if ( configUSE_CORE_AFFINITY == 1 ) && ( configNUMBER_OF_CORES > 1 )
     {
@@ -3722,7 +3760,7 @@ void vTaskStartScheduler( void )
          * FreeRTOSConfig.h file. */
         portCONFIGURE_TIMER_FOR_RUN_TIME_STATS();
 
-        traceTASK_SWITCHED_IN();
+        traceTASK_SWITCHED_IN( xTickCount, pxCurrentTCB->pcTaskName );
 
         traceSTARTING_SCHEDULER( xIdleTaskHandles );
 
@@ -4683,6 +4721,8 @@ BaseType_t xTaskCatchUpTicks( TickType_t xTicksToCatchUp )
 #endif /* INCLUDE_xTaskAbortDelay */
 /*----------------------------------------------------------*/
 
+static TCB_t            xTimelineTCBs[ configTimeline_TASK_COUNT ];
+static StackType_t     xTimelineStacks[ configTIMELINE_TASK_COUNT ][ configMAX_TASK_STACK_SIZE ];
 BaseType_t xTaskIncrementTick( void )
 {
     TCB_t * pxTCB;
@@ -4709,6 +4749,97 @@ BaseType_t xTaskIncrementTick( void )
         /* Increment the RTOS tick, switching the delayed and overflowed
          * delayed lists if it wraps to 0. */
         xTickCount = xConstTickCount;
+
+        /* Reschedule logic:
+           Check if the running task has reached its end time or is suspended.
+           Reset it, move it to the next major cycle and place it in the delayed list.
+        */
+        if ( pxCurrentTCB != NULL )
+        {
+            /* Check if the current task has reached its end time */
+            if ( xTickCount >= pxCurrentTCB->xEndTime )
+            {
+                traceTASK_MISSED_DEADLINE( xTickCount, pxCurrentTCB->pcTaskName );
+
+                #if ( configUSE_TIMELINE_DEADLINE_HOOK == 1 )
+                {
+                    extern void vApplicationTimelineDeadlineMissedHook( TaskHandle_t xTask );
+                    vApplicationTimelineDeadlineMissedHook( ( TaskHandle_t ) pxCurrentTCB );
+                }
+                #endif
+
+                 /* Remove from Ready List */
+                 if( uxListRemove( &( pxCurrentTCB->xStateListItem ) ) == ( UBaseType_t ) 0 )
+                 {
+                     portRESET_READY_PRIORITY( pxCurrentTCB->uxPriority, uxTopReadyPriority );
+                 }
+
+                 prvRescheduleTask( pxCurrentTCB );
+                 
+                 xSwitchRequired = pdTRUE;
+            }
+        }
+
+
+        if( ( xTickCount % configTIMELINE_MAJOR_FRAME_TICKS ) == 0 )
+        {
+            
+            g_majorCycleIndex = xTickCount / configTIMELINE_MAJOR_FRAME_TICKS;
+            traceMajor( xTickCount, g_majorCycleIndex );
+
+            #if ( configUSE_TIMELINE_SCHEDULER == 1 )
+            /* Reset all tasks for the new major frame to ensure deterministic order */
+            for( int i = 0; i < configTIMELINE_TASK_COUNT; i++ )
+            {
+                TCB_t *pxTCB = &xTimelineTCBs[ i ];
+                
+                /* Remove from current list (Ready, Delayed, Suspended, etc.) */
+                if( listLIST_ITEM_CONTAINER( &( pxTCB->xStateListItem ) ) != NULL )
+                {
+                    if( uxListRemove( &( pxTCB->xStateListItem ) ) == ( UBaseType_t ) 0 )
+                    {
+                        taskRESET_READY_PRIORITY( pxTCB->uxPriority );
+                    }
+                }
+                
+                /* Remove from Event List if needed (e.g. waiting on semaphores) */
+                 if( listLIST_ITEM_CONTAINER( &( pxTCB->xEventListItem ) ) != NULL )
+                {
+                    listREMOVE_ITEM( &( pxTCB->xEventListItem ) );
+                }
+
+                /* Update timing for next frame if not already updated */
+                /* If xStartTime is less than current tick, it belongs to previous frame */
+                if( pxTCB->xStartTime < xTickCount )
+                {
+                     pxTCB->xStartTime += configTIMELINE_MAJOR_FRAME_TICKS;
+                     pxTCB->xEndTime += configTIMELINE_MAJOR_FRAME_TICKS;
+                }
+                
+                /* Reset internal state so task restarts from beginning */
+                pxTCB->xNeedsReset = pdTRUE;
+
+                /* Add to appropriate list */
+                if( pxTCB->xStartTime <= xTickCount )
+                {
+                    /* Ready to run immediately */
+                    prvAddTaskToReadyList( pxTCB );
+                }
+                else
+                {
+                    /* Delayed */
+                    listSET_LIST_ITEM_VALUE( &( pxTCB->xStateListItem ), pxTCB->xStartTime );
+                    vListInsert( pxDelayedTaskList, &( pxTCB->xStateListItem ) );
+                    
+                    if( pxTCB->xStartTime < xNextTaskUnblockTime )
+                    {
+                        xNextTaskUnblockTime = pxTCB->xStartTime;
+                    }
+                }
+            }
+            xSwitchRequired = pdTRUE;
+            #endif
+        }
 
         if( xConstTickCount == ( TickType_t ) 0U )
         {
@@ -4931,6 +5062,7 @@ BaseType_t xTaskIncrementTick( void )
 
     return xSwitchRequired;
 }
+
 /*-----------------------------------------------------------*/
 
 #if ( configUSE_APPLICATION_TASK_TAG == 1 )
@@ -5078,7 +5210,7 @@ BaseType_t xTaskIncrementTick( void )
         else
         {
             xYieldPendings[ 0 ] = pdFALSE;
-            traceTASK_SWITCHED_OUT();
+            traceTASK_SWITCHED_OUT( xTickCount, pxCurrentTCB->pcTaskName);
 
             #if ( configGENERATE_RUN_TIME_STATS == 1 )
             {
@@ -5124,7 +5256,7 @@ BaseType_t xTaskIncrementTick( void )
             /* More details at: https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/main/MISRA.md#rule-115 */
             /* coverity[misra_c_2012_rule_11_5_violation] */
             taskSELECT_HIGHEST_PRIORITY_TASK();
-            traceTASK_SWITCHED_IN();
+            traceTASK_SWITCHED_IN( xTickCount, pxCurrentTCB->pcTaskName );
 
             /* Macro to inject port specific behaviour immediately after
              * switching tasks, such as setting an end of stack watchpoint
@@ -8737,4 +8869,115 @@ void vTaskResetState( void )
     }
     #endif /* #if ( configGENERATE_RUN_TIME_STATS == 1 ) */
 }
+/*-----------------------------------------------------------*/
+
+
+void vConfigureScheduler( const TimelineTaskConfig_t *cfg )
+{
+    int i;
+
+    prvInitialiseTaskLists();
+
+    for( i = 0; i < configTIMELINE_TASK_COUNT; i++ )
+    {
+        /* Use statically allocated TCB and stack */
+        TCB_t      *pxNewTCB = &xTimelineTCBs[ i ];
+        StackType_t *pxStack  = xTimelineStacks[ i ];
+
+        pxNewTCB->pxStack = pxStack;
+
+        // Determine Priority: HRT gets high fixed priority,
+        // SRT gets tskIDLE_PRIORITY + 1
+        UBaseType_t uxPriority;
+        if( cfg[i].xType == TASK_SOFT_RT )
+        {
+            uxPriority = configSRT_TASK_PRIORITY;
+        }
+        else
+        {
+            uxPriority = configHRT_TASK_PRIORITY;
+        }
+
+        TickType_t xStartTime, xEndTime;
+
+        if( cfg[i].xType == TASK_HARD_RT )
+        {
+            xStartTime = cfg[i].xStartTime + ( configTIMELINE_MINOR_FRAME_TICKS * cfg[i].ulSubframeId );
+
+            TickType_t end1 = ( cfg[i].ulSubframeId + 1 ) * configTIMELINE_MINOR_FRAME_TICKS;
+            TickType_t end2 = cfg[i].xEndTime + ( configTIMELINE_MINOR_FRAME_TICKS * cfg[i].ulSubframeId );
+            
+            xEndTime = ( end1 < end2 ) ? end1 : end2;
+        }
+        else
+        {
+            xStartTime = 0;
+            xEndTime = configTIMELINE_MAJOR_FRAME_TICKS;
+        }
+
+        // Initialize Task using prvInitialiseNewTask
+        prvInitialiseNewTask( cfg[i].pxTaskCode,
+                              cfg[i].pcTaskName,
+                              cfg[i].usStackDepth,
+                              NULL, 
+                              uxPriority,
+                              NULL,
+                              pxNewTCB,
+                              NULL,
+                              xStartTime,
+                              xEndTime );
+
+        pxNewTCB->ucStaticallyAllocated = tskSTATICALLY_ALLOCATED_STACK_AND_TCB;
+         
+        listSET_LIST_ITEM_VALUE( &( pxNewTCB->xStateListItem ), xStartTime );
+        
+        // Tasks that start immediately go to ready list and start the task
+        if( xStartTime == 0 )
+        {
+            prvAddTaskToReadyList( pxNewTCB );
+            
+            if( ( pxCurrentTCB == NULL ) || ( pxNewTCB->uxPriority > pxCurrentTCB->uxPriority ) )
+            {
+                pxCurrentTCB = pxNewTCB;
+            }
+        }
+        else
+        {
+            // Task starts later add to delayed list
+            vListInsert( pxDelayedTaskList, &( pxNewTCB->xStateListItem ) );
+            
+            // Update xNextTaskUnblockTime so tick handler knows when to unblock
+            if( xStartTime < xNextTaskUnblockTime )
+            {
+                xNextTaskUnblockTime = xStartTime;
+            }
+        }
+
+        uxCurrentNumberOfTasks++;
+    }
+}
+
+#if ( INCLUDE_vTaskTimelineTerminate == 1 )
+    void vTaskTimelineTerminateFromISR( TaskHandle_t xTask )
+    {
+        TCB_t * pxTCB = ( TCB_t * ) xTask;
+
+        if( pxTCB != NULL )
+        {
+            /* Remove from current list (Ready, Delayed, Suspended, etc.) */
+            if( listLIST_ITEM_CONTAINER( &( pxTCB->xStateListItem ) ) != NULL )
+            {
+                if( uxListRemove( &( pxTCB->xStateListItem ) ) == ( UBaseType_t ) 0 )
+                {
+                    taskRESET_READY_PRIORITY( pxTCB->uxPriority );
+                }
+            }
+            
+            /* Reschedule for the next major frame */
+            prvRescheduleTask( pxTCB );
+        }
+    }
+#endif /* INCLUDE_vTaskTimelineTerminate */
+
+
 /*-----------------------------------------------------------*/

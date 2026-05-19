@@ -1,5 +1,5 @@
 /*
- * FreeRTOS Kernel <DEVELOPMENT BRANCH>
+ * FreeRTOS Kernel V11.2.0
  * Copyright (C) 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
  *
  * SPDX-License-Identifier: MIT
@@ -94,6 +94,13 @@
     #define configUSE_MALLOC_FAILED_HOOK    0
 #endif
 
+#ifndef configASSERT
+    #define configASSERT( x )
+    #define configASSERT_DEFINED    0
+#else
+    #define configASSERT_DEFINED    1
+#endif
+
 /* Basic FreeRTOS definitions. */
 #include "projdefs.h"
 
@@ -151,6 +158,68 @@
         #error Missing definition:  configDEINIT_TLS_BLOCK must be defined in FreeRTOSConfig.h when configUSE_C_RUNTIME_TLS_SUPPORT is set to 1.
     #endif
 #endif /* if ( configUSE_C_RUNTIME_TLS_SUPPORT == 1 ) */
+
+#ifndef configUSE_TIMELINE_SCHEDULER
+    #define configUSE_TIMELINE_SCHEDULER 0
+#endif
+
+#if ( configUSE_TIMELINE_SCHEDULER == 1 )
+    #ifndef configTIMELINE_TASK_COUNT
+        #error Missing definition: configTIMELINE_TASK_COUNT must be defined in FreeRTOSConfig.h when configUSE_TIMELINE_SCHEDULER is set to 1.
+    #endif
+
+    #if ( configTIMELINE_TASK_COUNT <= 0 )
+        #error configTIMELINE_TASK_COUNT must be greater than 0. Timeline scheduler requires at least one task.
+    #endif
+
+    #ifndef configTIMELINE_MAJOR_FRAME_TICKS
+        #error Missing definition: configTIMELINE_MAJOR_FRAME_TICKS must be defined in FreeRTOSConfig.h when configUSE_TIMELINE_SCHEDULER is set to 1.
+    #endif
+
+    #if ( configTIMELINE_MAJOR_FRAME_TICKS <= 0 )
+        #error configTIMELINE_MAJOR_FRAME_TICKS must be greater than 0. Major frame duration must be positive.
+    #endif
+
+    #ifndef configTIMELINE_MINOR_FRAME_TICKS
+        #error Missing definition: configTIMELINE_MINOR_FRAME_TICKS must be defined in FreeRTOSConfig.h when configUSE_TIMELINE_SCHEDULER is set to 1.
+    #endif
+
+    #if ( configTIMELINE_MINOR_FRAME_TICKS <= 0 )
+        #error configTIMELINE_MINOR_FRAME_TICKS must be greater than 0. Minor frame duration must be positive.
+    #endif
+
+    #if ( configTIMELINE_MAJOR_FRAME_TICKS < configTIMELINE_MINOR_FRAME_TICKS )
+        #error configTIMELINE_MAJOR_FRAME_TICKS must be >= configTIMELINE_MINOR_FRAME_TICKS. Major frame must contain at least one complete minor frame.
+    #endif
+
+    #if ( ( configTIMELINE_MAJOR_FRAME_TICKS % configTIMELINE_MINOR_FRAME_TICKS ) != 0 )
+        #error configTIMELINE_MAJOR_FRAME_TICKS must be evenly divisible by configTIMELINE_MINOR_FRAME_TICKS. Minor frames must align cleanly within major cycle.
+    #endif
+
+    #if ( configUSE_TIME_SLICING != 0 )
+        #error configUSE_TIME_SLICING must be set to 0 in FreeRTOSConfig.h when configUSE_TIMELINE_SCHEDULER is set to 1.
+    #endif
+
+    #if ( configUSE_PREEMPTION != 1 )
+        #error configUSE_PREEMPTION must be set to 1 in FreeRTOSConfig.h when configUSE_TIMELINE_SCHEDULER is set to 1.
+    #endif
+
+    #if ( configMAX_PRIORITIES != 3 )
+        #error configMAX_PRIORITIES must be set to 3 in FreeRTOSConfig.h when configUSE_TIMELINE_SCHEDULER is set to 1.
+    #endif
+
+    #define configHRT_TASK_PRIORITY ( configMAX_PRIORITIES - 1 )
+    #define configSRT_TASK_PRIORITY ( configMAX_PRIORITIES - 2 )
+
+    #ifndef configUSE_TIMELINE_DEADLINE_HOOK
+        #define configUSE_TIMELINE_DEADLINE_HOOK 0
+    #endif
+
+    #ifndef configUSE_TIMELINE_TASK_KILLED_HOOK
+        #define configUSE_TIMELINE_TASK_KILLED_HOOK 0
+    #endif
+
+#endif /* if ( configUSE_TIMELINE_SCHEDULER == 1 ) */
 
 /*
  * Check all the required application specific macros have been defined.
@@ -290,6 +359,10 @@
 
 #ifndef INCLUDE_xTaskGetCurrentTaskHandle
     #define INCLUDE_xTaskGetCurrentTaskHandle    1
+#endif
+
+#ifndef INCLUDE_vTaskTimelineTerminate
+    #define INCLUDE_vTaskTimelineTerminate       0
 #endif
 
 #if configUSE_CO_ROUTINES != 0
@@ -445,7 +518,7 @@
 #ifndef portRELEASE_TASK_LOCK
 
     #if ( configNUMBER_OF_CORES == 1 )
-        #define portRELEASE_TASK_LOCK()
+        #define portRELEASE_TASK_LOCK( xCoreID )
     #else
         #error portRELEASE_TASK_LOCK is required in SMP
     #endif
@@ -455,7 +528,7 @@
 #ifndef portGET_TASK_LOCK
 
     #if ( configNUMBER_OF_CORES == 1 )
-        #define portGET_TASK_LOCK()
+        #define portGET_TASK_LOCK( xCoreID )
     #else
         #error portGET_TASK_LOCK is required in SMP
     #endif
@@ -465,7 +538,7 @@
 #ifndef portRELEASE_ISR_LOCK
 
     #if ( configNUMBER_OF_CORES == 1 )
-        #define portRELEASE_ISR_LOCK()
+        #define portRELEASE_ISR_LOCK( xCoreID )
     #else
         #error portRELEASE_ISR_LOCK is required in SMP
     #endif
@@ -475,7 +548,7 @@
 #ifndef portGET_ISR_LOCK
 
     #if ( configNUMBER_OF_CORES == 1 )
-        #define portGET_ISR_LOCK()
+        #define portGET_ISR_LOCK( xCoreID )
     #else
         #error portGET_ISR_LOCK is required in SMP
     #endif
@@ -599,6 +672,10 @@
     #define portPOINTER_SIZE_TYPE    uint32_t
 #endif
 
+#ifndef __UARTPRINT__
+#include "uart.h"
+#endif
+
 /* Remove any unused trace macros. */
 #ifndef traceSTART
 
@@ -618,7 +695,7 @@
 
 /* Called after a task has been selected to run.  pxCurrentTCB holds a pointer
  * to the task control block of the selected task. */
-    #define traceTASK_SWITCHED_IN()
+    #define traceTASK_SWITCHED_IN(xTickCount, taskName) do { UART_debugger_build(xTickCount, taskName, " switched in"); }while ( 0 )
 #endif
 
 #ifndef traceSTARTING_SCHEDULER
@@ -649,8 +726,10 @@
 
 /* Called before a task has been selected to run.  pxCurrentTCB holds a pointer
  * to the task control block of the task being switched out. */
-    #define traceTASK_SWITCHED_OUT()
+    #define traceTASK_SWITCHED_OUT(xTickCount, taskName) do { UART_debugger_build(xTickCount, taskName, " switched out"); }while ( 0 )
 #endif
+
+
 
 #ifndef traceTASK_PRIORITY_INHERIT
 
@@ -661,6 +740,8 @@
  * muted. */
     #define traceTASK_PRIORITY_INHERIT( pxTCBOfMutexHolder, uxInheritedPriority )
 #endif
+
+
 
 #ifndef traceTASK_PRIORITY_DISINHERIT
 
@@ -1484,6 +1565,14 @@
     #define traceRETURN_xQueueCreateSet( pxQueue )
 #endif
 
+#ifndef traceENTER_xQueueCreateSetStatic
+    #define traceENTER_xQueueCreateSetStatic( uxEventQueueLength )
+#endif
+
+#ifndef traceRETURN_xQueueCreateSetStatic
+    #define traceRETURN_xQueueCreateSetStatic( pxQueue )
+#endif
+
 #ifndef traceENTER_xQueueAddToSet
     #define traceENTER_xQueueAddToSet( xQueueOrSemaphore, xQueueSet )
 #endif
@@ -1844,6 +1933,24 @@
     #define traceRETURN_vTaskPreemptionEnable()
 #endif
 
+#ifndef traceMajor
+    #define traceMajor(xTickCount,majorNumber) do { UART_debugger_buildMajor(xTickCount, "Started Major ", majorNumber); }while( 0 )
+#endif
+
+#ifndef traceTASK_MISSED_DEADLINE
+    #define traceTASK_MISSED_DEADLINE(xTickCount, xTaskName) do { UART_debugger_build(xTickCount, xTaskName, " killed"); } while (0)
+#endif
+
+#ifndef traceTASK_STARTED
+    #define traceTASK_STARTED(xTickCount, xTaskName) do { UART_debugger_build(xTickCount, xTaskName, " started"); } while (0)
+#endif
+
+#ifndef traceTASK_ENDED
+    #define traceTASK_ENDED(xTickCount, xTaskName) do { UART_debugger_build(xTickCount, xTaskName, " ended"); } while (0)
+#endif
+
+
+
 #ifndef traceENTER_vTaskSuspend
     #define traceENTER_vTaskSuspend( xTaskToSuspend )
 #endif
@@ -1869,7 +1976,7 @@
 #endif
 
 #ifndef traceENTER_vTaskStartScheduler
-    #define traceENTER_vTaskStartScheduler()
+    #define traceENTER_vTaskStartScheduler(xTickCount) do { UART_debugger_build(xTickCount, NULL, "ENTRO scheduler"); }while( 0 )
 #endif
 
 #ifndef traceRETURN_vTaskStartScheduler
@@ -3032,6 +3139,16 @@
     #define configCONTROL_INFINITE_LOOP()
 #endif
 
+/* Set configENABLE_PAC and/or configENABLE_BTI to 1 to enable PAC and/or BTI
+ * support and 0 to disable them. These are currently used in ARMv8.1-M ports. */
+#ifndef configENABLE_PAC
+    #define configENABLE_PAC    0
+#endif
+
+#ifndef configENABLE_BTI
+    #define configENABLE_BTI    0
+#endif
+
 /* Sometimes the FreeRTOSConfig.h settings only allow a task to be created using
  * dynamically allocated RAM, in which case when any task is deleted it is known
  * that both the task's stack and TCB need to be freed.  Sometimes the
@@ -3191,6 +3308,15 @@ typedef struct xSTATIC_TCB
         uint32_t ulDummy18[ configTASK_NOTIFICATION_ARRAY_ENTRIES ];
         uint8_t ucDummy19[ configTASK_NOTIFICATION_ARRAY_ENTRIES ];
     #endif
+
+    /* Dummies for timeline-scheduler fields in TCB_t */
+    BaseType_t xDummy27;       /* xNeedsReset */
+    uint32_t ulDummy28;        /* usStackDepth */
+    TickType_t xDummy29;       /* xStartTime */
+    TickType_t xDummy30;       /* xEndTime */
+    void * pxDummy31;          /* pxTaskCode */
+    void * pxDummy32;          /* pvParameters */
+
     #if ( tskSTATIC_AND_DYNAMIC_ALLOCATION_POSSIBLE != 0 )
         uint8_t uxDummy20;
     #endif
